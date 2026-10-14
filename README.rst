@@ -35,6 +35,7 @@ Features
 * Synchronize untracked manufacturing results back to linked Registry Devices.
 * Prepare tracked output serials from Device UID and synchronize the completed
   result back to its Registry Device.
+* Create new Devices in batches from editable rows or pasted spreadsheet columns.
 * Update selected Device fields in batches.
 * Define reusable Bundle Types with generated or manually entered Bundle IDs.
 * Validate Bundle composition against the variant-specific active Kit BoM and
@@ -88,6 +89,15 @@ Open ``Pinout -> Device Registry -> Devices`` and create a record for each
 physical device. Enter its Device UID and Device Type, then maintain Current
 Product / Current Form, state, quality, and location as production progresses.
 
+Quality Status is managed manually: Unknown is the default, Needs Test means a
+check is required, Testing means a check is in progress, and OK / Failed record
+its result. An interrupted check can return to Needs Test; a repeat check can
+start from OK or Failed. Changes are tracked in chatter. Keep test notes and
+report attachments in Log note, and use Physical Location Note for the device's
+physical place. Changing quality does not change the lifecycle state, Product
+Form, Final Lot, or inventory. Testing is available in Batch Update and as a
+Device list filter; Bundle readiness still requires OK.
+
 When the device becomes a finished retail unit, assign its Final Lot / Serial.
 The serial number must exactly match Device UID and belong to the selected
 Current Product. Completed deliveries, returns, and scrap operations update
@@ -96,6 +106,28 @@ unambiguous Device states automatically.
 Current Final Lot / Serial represents only the active serial of the current
 retail form. Clearing it keeps the Odoo lot, its Product, stock traceability,
 and sales metadata in the Device's Final Lot History.
+
+Use **Batch Create** in the Device list to register a new batch. Set Device Type
+and the common fields once, then add editable rows or paste tab-separated
+``UID / MAC / Address`` columns. Address means Robonomics Device Address. A
+single UID column also works; MAC and Address are optional. Keep tabs for empty
+cells. An optional first-line header is ``UID``, ``Device UID``,
+``UID<TAB>MAC<TAB>Address`` or
+``Device UID<TAB>MAC<TAB>Robonomics Device Address`` (case-insensitive).
+Empty lines are ignored and surrounding cell whitespace is removed. **Parse /
+Replace Rows** replaces the editable table; review its count, edit or remove
+rows, and use **Check Rows** before **Create Devices**. If you edit the pasted
+text again, parse it again; creation uses the table.
+
+Only Device Type and Device UID must be supplied; State defaults to WIP and
+Quality Status to Unknown. Product, location, physical note, MAC and Address
+may remain empty. Checks report row numbers for missing, repeated or already
+used UIDs, including archived Devices, without exposing existing record details.
+Creation rechecks the rows and creates the whole batch atomically with your
+normal access rights. A failure leaves the input available for correction;
+success opens only the newly created Devices. Cancel creates no Devices. The
+wizard creates registry identities without stock quantities, lots, bundles or
+manufacturing orders.
 
 Select multiple records in the Device list and use Batch Update to change only
 the selected fields together.
