@@ -1,5 +1,9 @@
+import logging
 from datetime import timedelta
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 from odoo import fields
 from odoo.exceptions import AccessError, UserError
@@ -8,6 +12,8 @@ from odoo.tests.common import new_test_user
 from psycopg2 import OperationalError
 
 from .test_inventory_audit_calculation import InventoryAuditCase
+
+_logger = logging.getLogger(__name__)
 
 
 @tagged("post_install", "-at_install")
@@ -18,7 +24,7 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
         Result = self.env["pinout.inventory.audit.device"]
         for remaining in range(Result.search_count(domain), 0, -1):
             self.assertFalse(self.config.last_full_check_at)
-            self.config._cron_refresh(limit=1)
+            self.config._process_refresh(limit=1)
             self.assertEqual(Result.search_count(domain), remaining - 1)
             self.assertEqual(bool(self.config.last_full_check_at), remaining == 1)
         self.assertTrue(self.config.last_full_check_at)
@@ -50,11 +56,12 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
             )
         )
 
-    def test_bounded_cron_discovery_and_idempotence(self):
+    def test_bounded_manual_processing_and_idempotence(self):
         self.device()
         self.quant(1)
         self.quant(3, location=self.locations[1])
-        self.config._cron_refresh(limit=1)
+        self.config._queue_full_check()
+        self.config._process_refresh(limit=1)
         groups = (
             self.env["pinout.inventory.audit.group"]
             .sudo()
@@ -64,10 +71,10 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
         self.assertEqual(len(groups.filtered("pending")), 1)
         self.assertTrue(self.config.full_check_started_at)
         self.assertFalse(self.config.last_full_check_at)
-        self.config._cron_refresh(limit=1)
+        self.config._process_refresh(limit=1)
         self.assertFalse(groups.filtered("pending"))
         self._finish_pending_one_at_time()
-        self.config._cron_refresh(limit=1)
+        self.config._process_refresh(limit=1)
         self.assertEqual(
             groups,
             self.env["pinout.inventory.audit.group"]
@@ -77,31 +84,87 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
         surplus = groups.filtered(lambda g: g.location_id == self.locations[1])
         self.assertEqual(surplus.surplus_quantity, 3)
 
-    def test_daily_recovery_and_scope_change(self):
+    def test_legacy_cron_never_recalculates(self):
         device = self.device()
         quant = self.quant(1)
         self.config.action_refresh()
-        # Simulate a source change bypassing ORM hooks: the daily pass repairs it.
-        self.env.flush_all()
-        self.env.cr.execute(
-            "UPDATE stock_quant SET quantity = 0 WHERE id = %s", [quant.id]
-        )
-        quant.invalidate_recordset()
+        result = self.result(device)
+        checked_at = result.checked_at
         self.config.last_full_check_at = fields.Datetime.now() - timedelta(days=2)
-        self.config._cron_refresh()
-        self.assertEqual(
-            self.env["pinout.inventory.audit.group"]
-            .sudo()
-            .search([("company_id", "=", self.env.company.id)])
-            .status,
-            "group_shortage",
-        )
-        self.config.scope_ids.filtered(
-            lambda s: s.location_id == self.locations[0]
-        ).unlink()
-        self.config._cron_refresh()
-        self.assertEqual(self.result(device).status, "not_checked")
+        with (
+            patch.object(
+                type(self.config),
+                "_calculate",
+                side_effect=AssertionError("automatic calculation"),
+            ),
+            patch.object(
+                type(self.config),
+                "_queue_full_check",
+                side_effect=AssertionError("automatic discovery"),
+            ),
+        ):
+            # Old results do not trigger a daily recovery pass.
+            self.config._cron_refresh()
+            self.assertEqual(result.status, "match")
+            self.assertFalse(result.pending)
+            # ORM changes only mark the successful snapshot stale.
+            quant.quantity = 0
+            self.assertTrue(result.pending)
+            self.config._cron_refresh()
+            self.assertEqual(result.status, "match")
+            self.assertEqual(result.checked_at, checked_at)
+            # A changed scope does not schedule an automatic full pass either.
+            self.config.scope_ids.filtered(
+                lambda scope: scope.location_id == self.locations[0]
+            ).unlink()
+            self.assertTrue(self.config.full_check_pending)
+            self.config._cron_refresh()
+            self.assertTrue(self.config.full_check_pending)
+        self.config.action_refresh()
+        self.assertEqual(result.status, "not_checked")
+        self.assertFalse(result.pending)
         self.assertFalse(self.config.full_check_pending)
+        self.assertTrue(self.config.last_full_check_at)
+
+    def test_legacy_cron_is_inactive(self):
+        cron = self.env.ref("pinout_device_registry.inventory_audit_refresh_cron")
+        self.assertFalse(cron.active)
+
+    def test_migration_disables_noupdate_cron_without_changing_snapshots(self):
+        device = self.device()
+        quant = self.quant(1)
+        self.config.action_refresh()
+        result = self.result(device)
+        group = result.group_id
+        quant.quantity = 0
+        self.config.last_error = "Previous failure"
+        self.config.full_check_started_at = fields.Datetime.now()
+        cron = self.env.ref("pinout_device_registry.inventory_audit_refresh_cron")
+        data = self.env["ir.model.data"].search(
+            [
+                ("module", "=", "pinout_device_registry"),
+                ("name", "=", "inventory_audit_refresh_cron"),
+            ]
+        )
+        self.assertTrue(data.noupdate)
+        cron.active = True
+        unrelated = cron.copy({"name": "Unrelated test cron", "active": True})
+        records = [self.config, result, group, device, quant]
+        snapshots = [record.read(load=None) for record in records]
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "migrations/17.0.1.16.0/post-disable-inventory-audit-cron.py"
+        )
+        spec = spec_from_file_location("disable_inventory_audit_cron", path)
+        migration = module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        for _attempt in range(2):
+            migration.migrate(self.env.cr, "17.0.1.15.0")
+            self.assertFalse(cron.active)
+            self.assertTrue(unrelated.active)
+            self.assertTrue(data.noupdate)
+            for record, before in zip(records, snapshots, strict=True):
+                self.assertEqual(record.read(load=None), before)
 
     def test_device_refresh_updates_entire_group_only(self):
         first = self.device()
@@ -136,14 +199,14 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
             "_calculate",
             side_effect=ValueError("private source details"),
         ):
-            self.config._cron_refresh()
+            self.config.action_refresh()
         self.assertEqual(group.status, "match")
         self.assertEqual(result.status, "match")
         self.assertEqual(group.checked_at, checked_at)
         self.assertTrue(group.pending)
         self.assertIn("ValueError", group.last_error)
         self.assertNotIn("private source", group.last_error)
-        self.config._cron_refresh()
+        self.config.action_refresh()
         self.assertEqual(group.status, "group_shortage")
         self.assertFalse(group.last_error)
         self.assertFalse(result.pending)
@@ -153,6 +216,8 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
         other = self.device("CALC-2", location=self.locations[1])
         self.quant(1)
         self.config.action_refresh()
+        last_full_check_at = self.config.last_full_check_at
+        checked_at = self.result(device).checked_at
         self.quant(-1)
         self.quant(1, location=self.locations[1])
         Group = type(self.env["pinout.inventory.audit.group"])
@@ -164,13 +229,49 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
             return original(group, generation, values)
 
         with patch.object(Group, "_store_success", fail_one):
-            self.config._cron_refresh()
+            self.config.action_refresh()
         self.assertEqual(self.result(device).status, "match")
         self.assertTrue(self.result(device).pending)
+        self.assertEqual(self.result(device).checked_at, checked_at)
+        self.assertEqual(self.config.last_full_check_at, last_full_check_at)
+        self.assertTrue(self.config.last_error)
         self.assertFalse(self.result(other).pending)
         self.assertEqual(self.result(other).status, "match")
-        self.config._cron_refresh()
+        self.config.action_refresh()
         self.assertEqual(self.result(device).status, "group_shortage")
+        self.assertFalse(self.config.last_error)
+        self.assertFalse(self.config.full_check_started_at)
+
+    def test_selected_check_failure_rolls_back_the_request(self):
+        first = self.device()
+        second = self.device("SELECTED-2", location=self.locations[1])
+        self.quant(1)
+        self.quant(1, location=self.locations[1])
+        self.config.action_refresh()
+        self.quant(-1)
+        self.quant(-1, location=self.locations[1])
+        results = self.result(first) | self.result(second)
+        groups = results.group_id
+        before_results = results.read(load=None)
+        before_groups = groups.read(load=None)
+        Group = type(groups)
+        original = Group._store_success
+        calls = []
+
+        def fail_second(group, generation, values):
+            calls.append(group.id)
+            if len(calls) == 2:
+                raise ValueError("selected store failed")
+            return original(group, generation, values)
+
+        with patch.object(Group, "_store_success", fail_second):
+            with self.assertRaisesRegex(ValueError, "selected store failed"):
+                # Model the RPC rollback without committing test data.
+                with self.env.cr.savepoint():
+                    (first | second).action_refresh_inventory_audit()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(results.read(load=None), before_results)
+        self.assertEqual(groups.read(load=None), before_groups)
 
     def test_generation_captured_before_calculation(self):
         device = self.device()
@@ -189,7 +290,7 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
                 self.config._recalculate()
         self.assertTrue(group.pending)
         self.assertEqual(group.status, "match")
-        self.config._cron_refresh()
+        self.config.action_refresh()
         self.assertFalse(group.pending)
 
     def test_database_conflicts_propagate(self):
@@ -200,7 +301,7 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
             side_effect=OperationalError("serialization conflict"),
         ):
             with self.assertRaises(OperationalError):
-                self.config._cron_refresh()
+                self.config.action_refresh()
 
     def test_refresh_access_and_no_calculation_on_read(self):
         device = self.device()
@@ -237,7 +338,7 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
             device.read(["device_uid", "current_product_id"])
             self.result(device).read(["status", "pending"])
 
-    def test_concurrent_cron_and_manual_lock(self):
+    def test_concurrent_manual_checks_share_lock(self):
         # Advisory locks are visible across real connections without committing
         # test Devices or other fixture data.
         with self.registry.cursor() as other_cr:
@@ -259,17 +360,30 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
         self.assertTrue(self.config._try_refresh_lock())
 
     def test_discovery_failure_is_pending_and_retryable(self):
+        device = self.device()
         self.quant(1)
+        self.config.action_refresh()
+        result = self.result(device)
+        before = result.read(load=None)
+        last_full_check_at = self.config.last_full_check_at
+        original = type(self.config)._queue_full_check
+
+        def fail_after_discovery(config):
+            original(config)
+            raise ValueError("private discovery details")
+
         with patch.object(
             type(self.config),
             "_queue_full_check",
-            side_effect=ValueError("discovery failed"),
+            fail_after_discovery,
         ):
-            self.config._cron_refresh()
+            self.config.action_refresh()
         self.assertTrue(self.config.full_check_pending)
-        self.assertFalse(self.config.last_full_check_at)
+        self.assertEqual(self.config.last_full_check_at, last_full_check_at)
+        self.assertEqual(result.read(load=None), before)
         self.assertIn("discovery failed (ValueError)", self.config.last_error)
-        self.config._cron_refresh()
+        self.assertNotIn("private discovery", self.config.last_error)
+        self.config.action_refresh()
         self.assertFalse(self.config.full_check_pending)
         self.assertTrue(self.config.last_full_check_at)
         self.assertFalse(self.config.last_error)
@@ -316,17 +430,29 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
         from odoo.tools import mute_logger
         from psycopg2.errors import SerializationFailure
 
+        # Committed fixtures can survive a killed test process. Never collide
+        # with or delete sources owned by an earlier run.
+        namespace = uuid4().hex
+        fixture_name = f"Concurrency fixture {namespace}"
+        _logger.info("Audit concurrency %s: creating owned sources", namespace)
         cleanup_ids = None
         try:
-            with self.registry.cursor() as setup_cr:
+            # These sources have no committed audit configuration. Their global
+            # scope hooks are irrelevant to the calculation race and would lock
+            # unrelated configurations held by the main test transaction.
+            # Keep Quant dirty markers enabled in the actual source transaction.
+            with (
+                self.registry.cursor() as setup_cr,
+                patch.object(type(self.config), "_invalidate_scope", return_value=None),
+            ):
                 setup_cr.execute("SET LOCAL lock_timeout = '5s'")
                 env = api.Environment(setup_cr, SUPERUSER_ID, {})
-                partner = env["res.partner"].create({"name": "Concurrency fixture"})
+                partner = env["res.partner"].create({"name": fixture_name})
                 company = models.Model.create(
                     env["res.company"],
                     [
                         {
-                            "name": "Concurrency fixture",
+                            "name": fixture_name,
                             "partner_id": partner.id,
                             "currency_id": env.company.currency_id.id,
                         }
@@ -335,18 +461,18 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
                 company_id, partner_id = company.id, partner.id
                 location = env["stock.location"].create(
                     {
-                        "name": "Concurrency",
+                        "name": fixture_name,
                         "usage": "internal",
                         "company_id": company.id,
                     }
                 )
                 product = env["product.product"].create(
-                    {"name": "Concurrency", "type": "product"}
+                    {"name": fixture_name, "type": "product"}
                 )
                 device_type = env["pinout.device.type"].create(
                     {
-                        "name": "Concurrency",
-                        "code": "AUDIT-CONCURRENCY",
+                        "name": fixture_name,
+                        "code": f"AUDIT-CONCURRENCY-{namespace}",
                         "allowed_product_template_ids": [
                             fields.Command.set(product.product_tmpl_id.ids)
                         ],
@@ -354,7 +480,7 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
                 )
                 device = env["pinout.device"].create(
                     {
-                        "device_uid": "AUDIT-CONCURRENCY-1",
+                        "device_uid": f"AUDIT-CONCURRENCY-1-{namespace}",
                         "device_type_id": device_type.id,
                         "current_product_id": product.id,
                         "location_id": location.id,
@@ -386,11 +512,13 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
                 )
                 cleanup_ids = (device.id, product.product_tmpl_id.id, device_type.id)
                 setup_cr.commit()
+            _logger.info("Audit concurrency %s: testing source conflict", namespace)
             original = type(self.config)._calculate
 
             def change_after_read(config, *args):
                 snapshot = original(config, *args)
                 with self.registry.cursor() as source_cr:
+                    source_cr.execute("SET LOCAL lock_timeout = '5s'")
                     env = api.Environment(source_cr, SUPERUSER_ID, {})
                     env["stock.quant"].browse(quant_id).quantity = 0
                     # Same dirty marker used by the source hooks, in the source
@@ -413,6 +541,7 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
                 ),
             ):
                 with self.registry.cursor() as worker_cr:
+                    worker_cr.execute("SET LOCAL lock_timeout = '5s'")
                     env = api.Environment(worker_cr, SUPERUSER_ID, {})
                     worker = env["pinout.inventory.audit.config"].new(
                         {"company_id": company_id}
@@ -423,9 +552,14 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
                         mute_logger("odoo.sql_db"),
                     ):
                         with self.assertRaises(SerializationFailure):
-                            worker._recalculate()
+                            worker._recalculate(
+                                env["pinout.inventory.audit.group"].browse(group_id),
+                                env["pinout.device"],
+                            )
                     worker_cr.rollback()
+                _logger.info("Audit concurrency %s: retrying owned group", namespace)
                 with self.registry.cursor() as retry_cr:
+                    retry_cr.execute("SET LOCAL lock_timeout = '5s'")
                     env = api.Environment(retry_cr, SUPERUSER_ID, {})
                     group = env["pinout.inventory.audit.group"].browse(group_id)
                     self.assertTrue(group.pending)
@@ -433,13 +567,23 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
                     config = env["pinout.inventory.audit.config"].new(
                         {"company_id": company_id}
                     )
-                    config._recalculate()
+                    # Limit the retry to this fixture's group. A global pass
+                    # also processes unrelated unlocated Devices and can wait
+                    # on results held by the main test transaction.
+                    config._recalculate(group, env["pinout.device"])
                     self.assertFalse(group.pending)
                     self.assertEqual(group.status, "group_shortage")
                     retry_cr.commit()
         finally:
             if cleanup_ids:
-                with self.registry.cursor() as cleanup_cr:
+                _logger.info("Audit concurrency %s: cleaning owned sources", namespace)
+                with (
+                    self.registry.cursor() as cleanup_cr,
+                    patch.object(
+                        type(self.config), "_invalidate_scope", return_value=None
+                    ),
+                ):
+                    cleanup_cr.execute("SET LOCAL lock_timeout = '5s'")
                     env = api.Environment(cleanup_cr, SUPERUSER_ID, {})
                     device_id, template_id, type_id = cleanup_ids
                     env["pinout.inventory.audit.group"].browse(group_id).unlink()
@@ -451,3 +595,4 @@ class TestInventoryAuditRefresh(InventoryAuditCase):
                     env["res.company"].browse(company_id).unlink()
                     env["res.partner"].browse(partner_id).unlink()
                     cleanup_cr.commit()
+                _logger.info("Audit concurrency %s: cleanup complete", namespace)

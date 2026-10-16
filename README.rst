@@ -81,7 +81,7 @@ Create Bundle Types and configure their code, allowed Bundle Product Forms, and
 whether they require a Kit BoM. Kit products must have an active phantom BoM
 with the correct Apply on Variants values on component lines.
 
-For warehouse users, ``Configuration -> Inventory Audit`` defines the current
+For warehouse users, ``Configuration -> Audit Scope`` defines the current
 company's audit scope. Select locations and enable Include Child Locations for
 each root as needed. Only internal, non-scrap locations are checked; overlapping
 roots do not duplicate quantities. No scope is selected automatically on install
@@ -95,8 +95,9 @@ Inventory Audit
 ~~~~~~~~~~~~~~~
 
 Open ``Pinout -> Device Registry -> Inventory Audit`` to see discrepancies and
-the number of groups with unregistered surplus. Browse Groups provides filters
-for matches, shortages, surplus, stale results, and errors, with links to Devices,
+the number of groups with unregistered surplus. The Discrepancy Groups smart
+button opens groups; remove its default Discrepancies filter to see all results.
+Filters cover matches, shortages, surplus, freshness and errors, with links to Devices,
 Products, and Stock Quants. Each group uses an exact Product Variant, Location,
 and company; surplus in another group never compensates for a shortage.
 
@@ -104,7 +105,16 @@ Serial-tracked forms are checked against the current Final Lot, its Product,
 company, quantity one, and exact location. Missing or inconsistent serial stock
 gives Exact Mismatch. Missing Final Lot, lot tracking, incomplete metadata, or
 locations outside the configured scope give Not Checked with a reason.
-Historical Final Lots do not replace the current identity.
+Historical Final Lots do not replace the current identity. Details show expected
+and actual Product, serial, Location, company and quantities. Serial Stock Quants
+opens the current and saved serial's quants across locations with normal access
+rules. Equal group quantities do not prove that the expected serials match.
+
+Negative balances for the expected Product and company in non-scrap production,
+inventory, supplier or customer locations describe virtual operations and do not
+alone cause Exact Mismatch. They remain visible in details and source access
+checks. Positive stock elsewhere, negative internal/transit/scrap stock, and
+nonzero balances with another Product or company still cause a mismatch.
 
 Untracked forms compare the number of active Devices against physical quantity,
 including reserved stock. Sold, Scrapped, and archived Devices are excluded.
@@ -114,13 +124,32 @@ presence of a particular untracked Device. Unregistered Surplus is a reminder
 to investigate stock or registration; it does not mark existing Devices as wrong.
 
 The Device's Inventory Audit tab shows status, details, last successful check,
-and a separate pending/stale indicator. Inventory and Registry changes mark
-affected results pending in the same transaction. A cron runs every minute,
-processing up to 50 groups or ungrouped Devices per company; a full recovery
-pass runs daily and after scope changes. Refresh on a Device checks its whole
-group immediately; Refresh on the dashboard checks the company's full scope.
-Errors preserve the last successful result as stale until a successful retry.
-Refresh the page to see background updates.
+and separate freshness: No result, Recheck required, or No marked changes.
+No marked changes does not guarantee current stock. Inventory and Registry
+changes mark affected results pending in the same transaction, without
+recalculating them.
+
+Device list audit filters use the same accessible saved results as the displayed
+fields; filtering does not run a check. A missing result or an inaccessible
+source is shown as Not Checked / No result. Check scope and source access before
+requesting a new check; this state does not confirm a stock discrepancy.
+
+Checks run only when requested: Refresh on a Device checks its current and
+previous groups immediately; Refresh on the dashboard checks the company's
+full scope, including stock without registered Devices. Scope changes require
+another manual full check. There is no scheduled or daily recalculation; the
+legacy scheduled action is inactive on installation and disabled on upgrade.
+
+A full check preserves successfully checked groups when another group fails.
+Failed groups retain their last successful snapshot as stale, with an error;
+retry Refresh manually. The last full check date advances only after the whole
+pass succeeds. Full check state distinguishes an unconfigured scope, a check
+not performed, a required full pass, an incomplete pass and a completed pass.
+A source change marks affected results without erasing the previous full success.
+Discovery errors also preserve previous snapshots. A failed
+selected-Device check rolls back that request. Refresh the page if the displayed
+results from another open tab need to be updated. Manual Refresh reloads the
+current view automatically.
 
 Audit results respect warehouse access and source record rules. The audit
 updates only configuration and derived results; it never repairs stock,
